@@ -97,3 +97,4 @@ if __name__ == "__main__":
         print("Alerts sent to Telegram.")
     else:
         print("No VSA/RSI signals detected for this hour.")
+        send_telegram_message("✅ <b>VSA Scanner Update</b>\nScan complete. No significant institutional volume anomalies detected right now.")
