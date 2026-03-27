@@ -15,9 +15,6 @@ import yfinance as yf
 import pandas as pd
 from google import genai
 
-# ---------------------------------------------------------------------------
-# Secrets
-# ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 NEWS_API_KEY       = os.environ.get("NEWS_API_KEY")
@@ -25,9 +22,6 @@ GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ---------------------------------------------------------------------------
-# VSA Configuration — tune thresholds here
-# ---------------------------------------------------------------------------
 VSA_CONFIG = {
     "default_vol_multiplier": 1.3,
     "meta_vol_multiplier":    1.2,
@@ -40,28 +34,21 @@ VSA_CONFIG = {
     "data_interval":          "1h",
 }
 
-# ---------------------------------------------------------------------------
-# Shared Utilities
-# ---------------------------------------------------------------------------
+DIV = "&#x2501;" * 20
 
 def flatten_columns(df):
-    """Flatten multi-index columns from newer yfinance versions."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
 
-
 def calc_rsi(series, period=14):
-    """Pure-pandas RSI — no external TA library needed."""
     delta = series.diff()
     gain  = delta.where(delta > 0, 0.0).rolling(period).mean()
     loss  = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
     rs    = gain / loss.replace(0, float("nan"))
     return 100 - (100 / (1 + rs))
 
-
-def send_telegram_message(message, parse_mode="Markdown"):
-    """Unified Telegram sender — supports Markdown and HTML."""
+def send_telegram_message(message, parse_mode="HTML"):
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": parse_mode}
     try:
@@ -71,20 +58,17 @@ def send_telegram_message(message, parse_mode="Markdown"):
     except Exception as e:
         print(f"[Telegram] Failed: {e}")
 
-
 def get_yf_news(stock_obj, n=3):
-    """Returns n bullet headlines from yfinance built-in news."""
     try:
-        return "\n".join(f"- {item['title']}" for item in stock_obj.news[:n])
+        return "\n".join(f"&#9656; {item['title']}" for item in stock_obj.news[:n])
     except Exception:
-        return "- No recent news available."
-
+        return "&#9656; No recent news available."
 
 def get_newsapi_headlines(n=5):
-    """Fetches CIEN + macro headlines via NewsAPI. Falls back to yfinance news."""
     if not NEWS_API_KEY:
         print("[NewsAPI] Key not set — falling back to yfinance news.")
-        return get_yf_news(yf.Ticker("CIEN"), n=n).split("\n")
+        cien = yf.Ticker("CIEN")
+        return [item["title"] for item in cien.news[:n]]
     query = (
         "(Ciena OR CIEN OR AWS OR Google Cloud OR Meta OR Microsoft OR AI data center)"
         " OR (Federal Reserve OR rate cut)"
@@ -99,10 +83,7 @@ def get_newsapi_headlines(n=5):
     except Exception:
         return ["Failed to fetch NewsAPI headlines."]
 
-
-# ---------------------------------------------------------------------------
-# Module 1 — CIEN Intraday Pulse
-# ---------------------------------------------------------------------------
+# ── Module 1: CIEN Intraday Pulse ───────────────────────────────────────────
 
 def get_cien_technical_strength():
     cien = yf.Ticker("CIEN")
@@ -120,8 +101,7 @@ def get_cien_technical_strength():
     current_price = round(float(df["Close"].iloc[-1]), 2)
     open_price    = float(df["Open"].iloc[0])
     pct_change    = round(((current_price - open_price) / open_price) * 100, 2)
-
-    rsi = round(float(calc_rsi(df["Close"], 14).iloc[-1]), 1)
+    rsi           = round(float(calc_rsi(df["Close"], 14).iloc[-1]), 1)
 
     df["vol_sma10"] = df["Volume"].rolling(10).mean()
     vol_surge       = bool(df["Volume"].iloc[-1] > (df["vol_sma10"].iloc[-1] * 1.5))
@@ -149,7 +129,6 @@ def get_cien_technical_strength():
     })
     return result
 
-
 def get_gemini_sentiment(price, signal, details, headlines):
     prompt = f"""
     Current CIEN Price: ${price}.
@@ -171,38 +150,43 @@ def get_gemini_sentiment(price, signal, details, headlines):
     except Exception as e:
         return "ERROR", f"Gemini call failed: {e}"
 
-
 def run_cien_pulse():
     print("[CIEN Pulse] Running...")
     tech                 = get_cien_technical_strength()
     headlines            = get_newsapi_headlines()
     sentiment, rationale = get_gemini_sentiment(tech["price"], tech["signal"], tech["details"], headlines)
 
+    direction_emoji = "🔼" if tech["signal"] == "STRONG UP" else ("🔽" if tech["signal"] == "STRONG DOWN" else "➡️")
+    pct_sign        = "+" if tech["pct_change"] >= 0 else ""
+
     setup_block = ""
     if tech["signal"] != "NEUTRAL":
         setup_block = (
-            f"*SUGGESTED TRADE SETUP (ATR: ${tech['atr']})*\n"
-            f"- Entry:       ${tech['price']}\n"
-            f"- Stop Loss:   ${tech['stop_loss']}\n"
-            f"- Take Profit: ${tech['take_profit']}\n\n"
+            f"{DIV}\n"
+            f"🎯 <b>TRADE SETUP</b>  <i>(ATR ${tech['atr']})</i>\n"
+            f"   &#9656; Entry      <b>${tech['price']}</b>\n"
+            f"   &#9656; Stop Loss  <b>${tech['stop_loss']}</b> 🔴\n"
+            f"   &#9656; Target     <b>${tech['take_profit']}</b> 🟢\n"
         )
 
+    top_headline = headlines[0] if headlines else "No headline available."
+
     message = (
-        f"*CIEN Hourly Pulse*\n"
-        f"Price: ${tech['price']} ({tech['pct_change']}% today)\n"
-        f"Order Strength: {tech['signal']} ({tech['details']})\n"
-        f"Outlook: {sentiment}\n\n"
+        f"🚨 <b>CIEN HOURLY PULSE</b> 🚨\n"
+        f"{DIV}\n"
+        f"💰 Price      : <b>${tech['price']}</b>  ({pct_sign}{tech['pct_change']}% today)\n"
+        f"📊 Strength   : {direction_emoji} <b>{tech['signal']}</b>\n"
+        f"🔬 RSI        : <b>{tech['details']}</b>\n"
+        f"📈 Outlook    : <b>{sentiment}</b>\n"
         f"{setup_block}"
-        f"Rationale: {rationale}\n\n"
-        f"Top Headline:\n_{headlines[0]}_"
+        f"{DIV}\n"
+        f"💬 <i>{top_headline}</i>\n"
+        f"📝 {rationale}"
     )
-    send_telegram_message(message, parse_mode="Markdown")
+    send_telegram_message(message, parse_mode="HTML")
     print(f"[CIEN Pulse] Done -> {tech['signal']} | {sentiment}")
 
-
-# ---------------------------------------------------------------------------
-# Module 2 — Multi-Ticker VSA Scanner
-# ---------------------------------------------------------------------------
+# ── Module 2: VSA Multi-Ticker Scanner ──────────────────────────────────────
 
 def analyze_vsa(ticker):
     stock = yf.Ticker(ticker)
@@ -230,25 +214,35 @@ def analyze_vsa(ticker):
 
     vol_mult  = VSA_CONFIG["meta_vol_multiplier"] if ticker == "META" else VSA_CONFIG["default_vol_multiplier"]
     vol_ratio = vol / avg_vol if avg_vol > 0 else 0.0
+    news      = get_yf_news(stock)
 
     if (price < sma_20 and vol > vol_mult * avg_vol
             and price > open_p and rsi < VSA_CONFIG["rsi_accumulation_max"]):
         return (
-            f"🟢 <b>ACCUMULATION: {ticker}</b>\n"
-            f"Price: ${price:.2f} | RSI: {rsi:.1f} | SMA20: ${sma_20:.2f}\n"
-            f"Volume: {vol_ratio:.1f}x average\n\n"
-            f"<b>Headlines:</b>\n{get_yf_news(stock)}"
+            f"{DIV}\n"
+            f"🟢 <b>ACCUMULATION ALERT</b>\n"
+            f"📌 Ticker  : <b>{ticker}</b>\n"
+            f"💰 Price   : <b>${price:.2f}</b>\n"
+            f"📊 RSI     : <b>{rsi:.1f}</b>  |  SMA20: ${sma_20:.2f}\n"
+            f"📦 Volume  : <b>{vol_ratio:.1f}x</b> average\n"
+            f"{DIV}\n"
+            f"📰 <b>Headlines</b>\n{news}\n"
+            f"{DIV}"
         )
     elif (price > sma_20 and vol > vol_mult * avg_vol
             and price < open_p and rsi > VSA_CONFIG["rsi_distribution_min"]):
         return (
-            f"🔴 <b>DISTRIBUTION: {ticker}</b>\n"
-            f"Price: ${price:.2f} | RSI: {rsi:.1f} | SMA20: ${sma_20:.2f}\n"
-            f"Volume: {vol_ratio:.1f}x average\n\n"
-            f"<b>Headlines:</b>\n{get_yf_news(stock)}"
+            f"{DIV}\n"
+            f"🔴 <b>DISTRIBUTION ALERT</b>\n"
+            f"📌 Ticker  : <b>{ticker}</b>\n"
+            f"💰 Price   : <b>${price:.2f}</b>\n"
+            f"📊 RSI     : <b>{rsi:.1f}</b>  |  SMA20: ${sma_20:.2f}\n"
+            f"📦 Volume  : <b>{vol_ratio:.1f}x</b> average\n"
+            f"{DIV}\n"
+            f"📰 <b>Headlines</b>\n{news}\n"
+            f"{DIV}"
         )
     return None
-
 
 def run_vsa_scanner(tickers):
     print(f"[VSA Scanner] Scanning {len(tickers)} ticker(s)...")
@@ -260,26 +254,23 @@ def run_vsa_scanner(tickers):
             signals.append(result)
 
     if signals:
-        send_telegram_message("\n\n---\n\n".join(signals), parse_mode="HTML")
+        send_telegram_message("\n\n".join(signals), parse_mode="HTML")
         print(f"[VSA] {len(signals)} signal(s) sent.")
     else:
         send_telegram_message(
-            "<b>VSA Scanner</b>\nScan complete. No institutional volume anomalies detected.",
+            f"{DIV}\n✅ <b>VSA Scanner</b>\nNo institutional volume anomalies detected.\n{DIV}",
             parse_mode="HTML",
         )
         print("[VSA] No signals this hour.")
 
-
-# ---------------------------------------------------------------------------
-# Entry Point
-# ---------------------------------------------------------------------------
+# ── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run_cien_pulse()
 
     TICKERS_FILE = "tickers.txt"
     if not os.path.exists(TICKERS_FILE):
-        print(f"[VSA] {TICKERS_FILE} not found. Create it with one ticker per line.")
+        print(f"[VSA] {TICKERS_FILE} not found.")
     else:
         with open(TICKERS_FILE) as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
