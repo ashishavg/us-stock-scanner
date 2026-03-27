@@ -2,11 +2,10 @@
 CIEN & Multi-Ticker Combined Trading Scanner
 ============================================
 Module 1 - CIEN Hourly Pulse   : 5-min RSI + ATR + Volume + Gemini LLM -> Telegram
-Module 2 - VSA Multi-Ticker    : Hourly VSA + RSI -> Telegram
+Module 2 - VSA Multi-Ticker    : Hourly VSA + RSI(45/55) + VWAP confirmation -> Telegram
 Schedule  : 09:00-22:00 UTC Mon-Fri (4:30 AM - 6:00 PM ET, pre + post market covered)
 
 Dependencies: yfinance, pandas, requests, google-genai ONLY — no pandas-ta
-RSI computed with pure pandas calc_rsi() — works on any pandas version.
 """
 
 import os
@@ -25,8 +24,8 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 VSA_CONFIG = {
     "default_vol_multiplier": 1.3,
     "meta_vol_multiplier":    1.2,
-    "rsi_accumulation_max":   50,
-    "rsi_distribution_min":   50,
+    "rsi_accumulation_max":   45,   # tightened — avoids mid-range noise
+    "rsi_distribution_min":   55,   # tightened — avoids mid-range noise
     "rsi_period":             14,
     "sma_period":             20,
     "vol_avg_period":         20,
@@ -35,6 +34,8 @@ VSA_CONFIG = {
 }
 
 DIV = "&#x2501;" * 20
+
+# ── Shared Utilities ─────────────────────────────────────────────────────────
 
 def flatten_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
@@ -47,6 +48,17 @@ def calc_rsi(series, period=14):
     loss  = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
     rs    = gain / loss.replace(0, float("nan"))
     return 100 - (100 / (1 + rs))
+
+def calc_vwap(df):
+    """VWAP resets daily. Uses typical price × volume cumsum / volume cumsum."""
+    df = df.copy()
+    df["typical_price"] = (df["High"] + df["Low"] + df["Close"]) / 3
+    df["tp_vol"]        = df["typical_price"] * df["Volume"]
+    df["date"]          = df.index.normalize()
+    df["cum_tp_vol"]    = df.groupby("date")["tp_vol"].cumsum()
+    df["cum_vol"]       = df.groupby("date")["Volume"].cumsum()
+    df["VWAP"]          = df["cum_tp_vol"] / df["cum_vol"]
+    return df
 
 def send_telegram_message(message, parse_mode="HTML"):
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -67,8 +79,7 @@ def get_yf_news(stock_obj, n=3):
 def get_newsapi_headlines(n=5):
     if not NEWS_API_KEY:
         print("[NewsAPI] Key not set — falling back to yfinance news.")
-        cien = yf.Ticker("CIEN")
-        return [item["title"] for item in cien.news[:n]]
+        return [item["title"] for item in yf.Ticker("CIEN").news[:n]]
     query = (
         "(Ciena OR CIEN OR AWS OR Google Cloud OR Meta OR Microsoft OR AI data center)"
         " OR (Federal Reserve OR rate cut)"
@@ -83,7 +94,7 @@ def get_newsapi_headlines(n=5):
     except Exception:
         return ["Failed to fetch NewsAPI headlines."]
 
-# ── Module 1: CIEN Intraday Pulse ───────────────────────────────────────────
+# ── Module 1: CIEN Intraday Pulse ────────────────────────────────────────────
 
 def get_cien_technical_strength():
     cien = yf.Ticker("CIEN")
@@ -186,9 +197,16 @@ def run_cien_pulse():
     send_telegram_message(message, parse_mode="HTML")
     print(f"[CIEN Pulse] Done -> {tech['signal']} | {sentiment}")
 
-# ── Module 2: VSA Multi-Ticker Scanner ──────────────────────────────────────
+# ── Module 2: VSA Multi-Ticker Scanner ───────────────────────────────────────
 
 def analyze_vsa(ticker):
+    """
+    All 5 filters must pass:
+      ACCUMULATION : price < SMA-20  AND price < VWAP  AND vol > threshold
+                     AND close > open (bullish candle)  AND RSI < 45
+      DISTRIBUTION : price > SMA-20  AND price > VWAP  AND vol > threshold
+                     AND close < open (bearish candle)  AND RSI > 55
+    """
     stock = yf.Ticker(ticker)
     df    = flatten_columns(stock.history(
         period=VSA_CONFIG["data_period"],
@@ -203,6 +221,7 @@ def analyze_vsa(ticker):
     df["SMA_20"]     = df["Close"].rolling(VSA_CONFIG["sma_period"]).mean()
     df["Avg_Vol_20"] = df["Volume"].rolling(VSA_CONFIG["vol_avg_period"]).mean()
     df["RSI_14"]     = calc_rsi(df["Close"], VSA_CONFIG["rsi_period"])
+    df               = calc_vwap(df)
 
     latest  = df.iloc[-1]
     price   = float(latest["Close"])
@@ -211,32 +230,39 @@ def analyze_vsa(ticker):
     avg_vol = float(latest["Avg_Vol_20"])
     sma_20  = float(latest["SMA_20"])
     rsi     = float(latest["RSI_14"])
+    vwap    = float(latest["VWAP"])
 
     vol_mult  = VSA_CONFIG["meta_vol_multiplier"] if ticker == "META" else VSA_CONFIG["default_vol_multiplier"]
     vol_ratio = vol / avg_vol if avg_vol > 0 else 0.0
     news      = get_yf_news(stock)
 
-    if (price < sma_20 and vol > vol_mult * avg_vol
-            and price > open_p and rsi < VSA_CONFIG["rsi_accumulation_max"]):
+    if (price < sma_20 and price < vwap
+            and vol > vol_mult * avg_vol
+            and price > open_p
+            and rsi < VSA_CONFIG["rsi_accumulation_max"]):
         return (
             f"{DIV}\n"
             f"🟢 <b>ACCUMULATION ALERT</b>\n"
             f"📌 Ticker  : <b>{ticker}</b>\n"
             f"💰 Price   : <b>${price:.2f}</b>\n"
             f"📊 RSI     : <b>{rsi:.1f}</b>  |  SMA20: ${sma_20:.2f}\n"
+            f"📉 VWAP    : <b>${vwap:.2f}</b>  (price below VWAP ✅)\n"
             f"📦 Volume  : <b>{vol_ratio:.1f}x</b> average\n"
             f"{DIV}\n"
             f"📰 <b>Headlines</b>\n{news}\n"
             f"{DIV}"
         )
-    elif (price > sma_20 and vol > vol_mult * avg_vol
-            and price < open_p and rsi > VSA_CONFIG["rsi_distribution_min"]):
+    elif (price > sma_20 and price > vwap
+            and vol > vol_mult * avg_vol
+            and price < open_p
+            and rsi > VSA_CONFIG["rsi_distribution_min"]):
         return (
             f"{DIV}\n"
             f"🔴 <b>DISTRIBUTION ALERT</b>\n"
             f"📌 Ticker  : <b>{ticker}</b>\n"
             f"💰 Price   : <b>${price:.2f}</b>\n"
             f"📊 RSI     : <b>{rsi:.1f}</b>  |  SMA20: ${sma_20:.2f}\n"
+            f"📈 VWAP    : <b>${vwap:.2f}</b>  (price above VWAP ✅)\n"
             f"📦 Volume  : <b>{vol_ratio:.1f}x</b> average\n"
             f"{DIV}\n"
             f"📰 <b>Headlines</b>\n{news}\n"
@@ -263,14 +289,14 @@ def run_vsa_scanner(tickers):
         )
         print("[VSA] No signals this hour.")
 
-# ── Entry Point ──────────────────────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run_cien_pulse()
 
     TICKERS_FILE = "tickers.txt"
     if not os.path.exists(TICKERS_FILE):
-        print(f"[VSA] {TICKERS_FILE} not found.")
+        print(f"[VSA] {TICKERS_FILE} not found. Create it with one ticker per line.")
     else:
         with open(TICKERS_FILE) as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
