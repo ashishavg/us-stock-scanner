@@ -1,5 +1,5 @@
 yfinance>=0.2.40
 pandas>=2.0.0
-pandas-ta>=0.3.14b
+pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git@development
 requests>=2.31.0
 google-genai>=0.8.0
