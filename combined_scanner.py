@@ -10,7 +10,6 @@ import os
 import requests
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 from google import genai
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
